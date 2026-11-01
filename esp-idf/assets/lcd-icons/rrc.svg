@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none"
+     stroke="#eef3f8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Relay chat: a speech bubble with a # in it — a room, at a glance, and not
+       LXMF's envelope beside it. -->
+  <path d="M10 12 h44 a4 4 0 0 1 4 4 v24 a4 4 0 0 1 -4 4 h-26 l-10 9 v-9 h-8 a4 4 0 0 1 -4 -4 v-24 a4 4 0 0 1 4 -4 z"/>
+  <path d="M27 19 l-3 18 M39 19 l-3 18 M20 25 h22 M18 31 h22"/>
+</svg>

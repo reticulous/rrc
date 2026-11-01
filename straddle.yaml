@@ -1,0 +1,56 @@
+# rrc — Reticulum Relay Chat client on spangap.
+#
+# The node is the RRC client: the rrc task holds the Links to `rrc.hub`
+# destinations, keeps the room logs and counts what is unread, so the device is
+# its own bouncer — still in the room while nobody is looking. The browser
+# window and the LCD app are two views of that state, through storage, as lxmf's
+# are (s.rrc.*, rrc.*, secrets.rrc.*). It speaks to rnsd only through rnsd.h.
+schema_version: 1
+name: reticulous/rrc
+prefix: rrc
+version: 0.1.0
+banner: "Reticulum Relay Chat"
+firmware: esp-idf
+browser: browser
+platforms: [idf]
+requires:
+  - reticulous/rns
+# RrcService (the rrc task) registers with the RNS lifecycle, so it starts once
+# rnsd is up. RrcApp is the LCD launcher tile, compiled only when the lcd
+# straddle is staged (conditional/spangap-lcd/).
+services:
+  - { class: RrcService, header: rrc.h }
+  - { class: RrcApp, header: rrc_app.h, when: spangap/spangap-lcd }
+  - { class: RrcTinyPage, header: rrc_tiny.h, when: spangap/tinylcd }
+
+browser_register:
+  - call: registerRrc
+
+settings:
+  - at:
+      - { id: reticulum }
+      - { id: rrc, label: "Relay Chat", short: "RRC", order: 8 }
+    rows:
+      - section: "Relay Chat"
+      - caption: "Live rooms on Reticulum Relay Chat hubs. This node stays in your rooms while no screen is open, and keeps what was said there; the RRC app is where you read and write."
+      - text: { label: "Nick", key: "s.rrc.nick", placeholder: "the LXMF display name you chat as" }
+      - caption: "The name others see. A hub can be given a nick of its own in the RRC app."
+      - dropdown:
+          label: "Sound"
+          key: "s.rrc.sound"
+          options:
+            - { v: "off", l: "Off" }
+            - { v: "mentions", l: "When someone mentions you" }
+            - { v: "all", l: "On every line" }
+      - caption: "A room set to Off in the app never makes a sound."
+      - dropdown:
+          label: "Joins and leaves"
+          key: "s.rrc.presence"
+          options:
+            - { v: "collapsed", l: "Folded into one line" }
+            - { v: "shown", l: "One line each" }
+            - { v: "hidden", l: "Not shown" }
+      - integer: { label: "Lines kept per room", key: "s.rrc.keep", min: 50, max: 2000 }
+      - caption: "Older lines are dropped from the device as new ones arrive."
+      - integer: { label: "Hubs connected at once", key: "s.rrc.max_hubs", min: 1, max: 4 }
+      - caption: "Each connected hub holds one Reticulum Link open for as long as it is connected."

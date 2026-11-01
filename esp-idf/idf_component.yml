@@ -1,0 +1,10 @@
+description: "rrc: Reticulum Relay Chat client on spangap. The node holds the hub Links; the browser window and the LCD app are views of its state."
+url: https://github.com/reticulous/rrc
+version: "0.1.0"
+license: "Apache-2.0"
+targets:
+  - esp32s3
+  - esp32p4
+dependencies:
+  idf:
+    version: ">=5.5"
