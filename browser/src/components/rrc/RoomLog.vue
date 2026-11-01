@@ -30,7 +30,7 @@
         <span class="x">
           <b v-if="r.line.kind === LineKind.Action" class="nkc" :style="{ color: r.colour }"
              @click="emit('nick', r.line.src, r.line.nick)">{{ r.line.nick }}</b><template
-            v-if="r.line.kind === LineKind.Action"> </template>
+            v-if="r.line.kind === LineKind.Action">{{ ' ' }}</template>
           <template v-for="(s, i) in r.segs" :key="i">
             <span v-if="s.t === 'text'">{{ s.text }}</span>
             <a v-else href="#" @click.prevent="emit('link', s)">{{ s.text }}</a>
