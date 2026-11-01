@@ -149,12 +149,23 @@ const int LXMF_SLOTS = 10;
 enum { KIND_MSG = 0, KIND_ACTION = 1, KIND_NOTICE = 2, KIND_PRESENCE = 3, KIND_SYSTEM = 4 };
 enum { ST_QUEUED = 0, ST_RELAYED = 1, ST_FAILED = 2, ST_RECEIVED = 3 };
 
-/* Keep only what the UI font can draw: strip C0/C1 controls and any codepoint
- * with no glyph (emoji, CJK, …) so network text never leaves placeholder boxes.
+/* Codepoints that only modify their neighbours: combining marks, zero-width
+ * joiners and spaces, variation selectors, skin tones, tag characters. */
+static bool zeroWidth(uint32_t cp) {
+    return (cp >= 0x300 && cp <= 0x36F) || (cp >= 0x200B && cp <= 0x200F) ||
+           (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0x1F3FB && cp <= 0x1F3FF) ||
+           (cp >= 0xE0000 && cp <= 0xE007F);
+}
+
+/* Make network text drawable in the UI font: strip C0/C1 controls and
+ * zero-width modifiers, and show each run of codepoints with no glyph (emoji,
+ * CJK, …) as one '?', so it never leaves LVGL's placeholder boxes and a name
+ * written only in such characters still shows as something.
  * `oneLine` folds CR/LF/TAB to a space; otherwise newlines stay. */
 std::string printable(std::string_view in, bool oneLine) {
     std::string out;
     out.reserve(in.size());
+    bool inRun = false;
     size_t i = 0, n = in.size();
     while (i < n) {
         uint8_t b = (uint8_t)in[i];
@@ -174,10 +185,15 @@ std::string printable(std::string_view in, bool oneLine) {
         if (!ok) { i++; continue; }
         size_t at = i;
         i += len;
-        if (cp == '\n' || cp == '\r' || cp == '\t') { out += oneLine ? ' ' : (char)cp; continue; }
-        if (cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F)) continue;
+        if (cp == '\n' || cp == '\r' || cp == '\t') { out += oneLine ? ' ' : (char)cp; inRun = false; continue; }
+        if (cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F) || zeroWidth(cp)) continue;
         lv_font_glyph_dsc_t g;
-        if (!lv_font_get_glyph_dsc(kFont, &g, cp, 0) || g.is_placeholder) continue;
+        if (!lv_font_get_glyph_dsc(kFont, &g, cp, 0) || g.is_placeholder) {
+            if (!inRun) out += '?';
+            inRun = true;
+            continue;
+        }
+        inRun = false;
         out.append(in.data() + at, len);
     }
     return out;

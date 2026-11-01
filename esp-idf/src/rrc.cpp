@@ -9,7 +9,10 @@
  *   session     rnsdLinkOpen(hub, "rrc.hub") → LINKIDENTIFY (queued at once,
  *               rnsd sends it ahead of our data) → on rnsd.links.rrc<N>.state
  *               "active" a HELLO, resent every 4 s up to 5 times → WELCOME →
- *               rejoin every room wanted on that hub → live. A lost Link is a
+ *               rejoin every room wanted on that hub → live. A room is in on
+ *               our own JOINED or on the "room <r>: …" notice that follows
+ *               it, since rrcd drops a JOINED whose member list outgrows the
+ *               Link MDU. A lost Link is a
  *               new session after a backoff of 5 s · 15 s · 45 s · 2 min ·
  *               5 min (±20 %).
  *   pacing      everything sent to a hub goes through a token bucket that
@@ -458,7 +461,7 @@ struct Pending {                            /* sent, waiting for the hub's echo 
 
 struct Quiet { std::string what; int64_t until; };  /* "who:<room>" | "list" */
 
-struct ResExpect { std::string id, kind, sha; uint32_t size; int64_t until; };
+struct ResExpect { std::string id, kind, sha, room; bool hasRoom = false; uint32_t size = 0; int64_t until = 0; };
 
 enum SlotState { SL_FREE, SL_LINKING, SL_HELLO, SL_LIVE };
 
@@ -907,6 +910,15 @@ static bool parseList(Slot& s, const std::string& text)
     return true;
 }
 
+static void roomEntered(Slot& s, const std::string& rid)
+{
+    Room& r = s_rooms[rid];
+    roomPublishState(rid, "in");
+    rosterSet(rid, hexOf(s.src, 6), s.nick, hexOf(s.src, 16));
+    info("rrc %s: in %s", s.hub.c_str(), r.name.c_str());
+    sendQuiet(s, "who:" + rid, "/who " + r.name);
+}
+
 /* "room <r>: registered; mode=+nt; topic=<t>" after a JOIN, and
  * "topic for <r> is now: <t>" when it changes. */
 static bool parseRoomInfo(Slot& s, const std::string& text)
@@ -916,6 +928,7 @@ static bool parseRoomInfo(Slot& s, const std::string& text)
         if (c == std::string::npos) return false;
         std::string rid = ridFor(s, text.substr(5, c - 5));
         if (rid.empty()) return false;
+        if (s_rooms[rid].state == "joining") roomEntered(s, rid);
         size_t m = text.find("mode=", c), t = text.find("topic=", c);
         std::string mode = m == std::string::npos ? "" : text.substr(m + 5, text.find(';', m) - m - 5);
         std::string topic = t == std::string::npos ? "" : text.substr(t + 6);
@@ -947,18 +960,18 @@ static bool takeQuiet(Slot& s, const std::string& what)
     return false;
 }
 
-static void onNotice(Slot& s, const Value& env, const std::string& text)
+/* A NOTICE, whether it came as a packet or as a Resource. */
+static void onNoticeText(Slot& s, const std::string* room, const std::string& src12,
+                         const std::string& nick, const std::string& text)
 {
-    const std::string* room = textOf(env.at(K_ROOM));
     if (room) {
         std::string rid = ridFor(s, *room);
         if (rid.empty()) return;
         if (parseRoomInfo(s, text)) return;
         LogLine l;
         l.kind = KIND_NOTICE;
-        const Value* src = env.at(K_SRC);
-        if (src && src->isBytes() && src->s.size() == 16) l.src12 = hexOf(src->s).substr(0, 12);
-        if (const std::string* n = textOf(env.at(K_NICK))) l.nick = clean(*n, true);
+        l.src12 = src12;
+        l.nick = nick;
         l.text = clean(text);
         logAppend(rid, l);
         return;
@@ -977,6 +990,15 @@ static void onNotice(Slot& s, const Value& env, const std::string& text)
     }
     std::string rid = nowMs() < s.lastCmdUntil ? s.lastCmdRid : "";
     hubNote(s.hub, rid, text);
+}
+
+static void onNotice(Slot& s, const Value& env, const std::string& text)
+{
+    std::string src12, nick;
+    const Value* src = env.at(K_SRC);
+    if (src && src->isBytes() && src->s.size() == 16) src12 = hexOf(src->s).substr(0, 12);
+    if (const std::string* n = textOf(env.at(K_NICK))) nick = clean(*n, true);
+    onNoticeText(s, textOf(env.at(K_ROOM)), src12, nick, text);
 }
 
 static void onWelcome(Slot& s, const Value& env)
@@ -1070,10 +1092,7 @@ static void onPresence(Slot& s, const Value& env, bool joined)
 
     if (joined && !nick && r.state == "joining") {
         /* Our own JOINED: it carries no nick. */
-        roomPublishState(rid, "in");
-        rosterSet(rid, hexOf(s.src, 6), s.nick, hexOf(s.src, 16));
-        info("rrc %s: in %s", s.hub.c_str(), r.name.c_str());
-        sendQuiet(s, "who:" + rid, "/who " + r.name);
+        roomEntered(s, rid);
         return;
     }
     if (!joined && r.state == "parting") return;
@@ -1165,6 +1184,7 @@ static void onResourceEnvelope(Slot& s, const Value& env)
     if (const std::string* k = textOf(b->at(1))) e.kind = *k;
     if (const Value* v = b->at(2); v && v->isUint()) e.size = (uint32_t)v->u;
     if (const Value* v = b->at(3); v && v->isBytes()) e.sha = v->s;
+    if (const std::string* r = textOf(env.at(K_ROOM))) { e.hasRoom = true; e.room = *r; }
     if (e.size == 0 || e.size > 16384) return;
     e.until = nowMs() + 30000;
     if (s.res.size() >= 8) s.res.erase(s.res.begin());
@@ -1286,13 +1306,18 @@ static void onResourceAux(TaskHandle_t, const void* data, size_t len)
         for (auto it = s->res.begin(); it != s->res.end(); ++it) {
             if (it->size != d.len || nowMs() > it->until) continue;
             if (!it->sha.empty() && it->sha != shaS) continue;
-            std::string text = clean(std::string_view((const char*)d.buf, d.len));
-            if (it->kind == "motd") {
-                s->motdTaken = true;
-                storageSet(hubRam(s->hub, "motd").c_str(), text.c_str());
-            }
-            hubNote(s->hub, "", text);
+            ResExpect e = *it;
             s->res.erase(it);
+            std::string text((const char*)d.buf, d.len);
+            if (e.kind == "motd") {
+                s->motdTaken = true;
+                storageSet(hubRam(s->hub, "motd").c_str(), clean(text).c_str());
+                hubNote(s->hub, "", clean(text));
+            } else if (e.kind == "notice") {
+                onNoticeText(*s, e.hasRoom ? &e.room : nullptr, "", "", text);
+            } else {
+                hubNote(s->hub, "", clean(text));
+            }
             break;
         }
     }

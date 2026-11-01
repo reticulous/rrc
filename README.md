@@ -6,7 +6,8 @@ node                                        hub (rrc.hub)
   ── HELLO {name, version, caps} + NICK ───▶   resent every 4 s until WELCOME
   ◀─ WELCOME {hub, version, caps, limits} ──
   ── JOIN #room [key] ─────────────────────▶   every room wanted on this hub
-  ◀─ JOINED ─────────────────────────────────
+  ◀─ JOINED ─────────────────────────────────   may never come: see below
+  ◀─ NOTICE "room <r>: registered; …" ──────   also means we are in
   ── MSG "/who #room", MSG "/list" ────────▶   answered as NOTICEs, read quietly
   ◀▶ MSG / ACTION / NOTICE / JOINED / PARTED / PING / PONG
 ```
@@ -21,8 +22,14 @@ was connected and nothing from before.
 
 It speaks [RRC](https://rrc.kc1awv.net) v1 plus the extensions of the reference
 hub, `kc1awv/rrcd`: the numeric limits map in WELCOME, the slash commands, the
-`rrc.hub` announce, resource envelopes for a long MOTD. It advertises
+`rrc.hub` announce, resource envelopes for a long MOTD or notice. It advertises
 capabilities 0 (resources) and 1 (ACTION).
+
+rrcd sends a packet it cannot fit in one Link MDU (about 430 bytes) as
+nothing at all. A JOINED carrying a busy room's member list is such a packet,
+so the node takes the "room <r>: …" notice rrcd sends only to a successful
+joiner as being in the room too. A long reply to `/who` arrives as a Resource
+of kind `notice` and is read like any other notice.
 
 ## Using it
 
