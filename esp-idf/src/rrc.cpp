@@ -1818,8 +1818,6 @@ static void cliHeardLeaf(const char* key, const char* val)
               monoS() - std::atoi(v.c_str()), v.substr(p2 + 1).c_str());
 }
 
-struct CliLog { std::vector<std::string> lines; };
-static CliLog* s_cliLog = nullptr;
 static std::string s_cliLogPfx;
 static std::map<std::string, std::map<std::string, std::string>>* s_cliRecs = nullptr;
 static void cliLogLeaf(const char* key, const char* val)

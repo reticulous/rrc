@@ -9,7 +9,6 @@ schema_version: 1
 name: reticulous/rrc
 prefix: rrc
 version: 0.1.0
-banner: "Reticulum Relay Chat"
 firmware: esp-idf
 browser: browser
 platforms: [idf]

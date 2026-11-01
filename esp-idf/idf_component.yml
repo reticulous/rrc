@@ -5,6 +5,7 @@ license: "Apache-2.0"
 targets:
   - esp32s3
   - esp32p4
+  - linux
 dependencies:
   idf:
     version: ">=5.5"
