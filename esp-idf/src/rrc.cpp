@@ -129,6 +129,16 @@ static bool hexTo(const std::string& s, uint8_t* out, size_t n)
     return true;
 }
 
+/* Typed hex may be grouped by spaces anywhere, and a hash may be given in full
+ * (64 hex), whose leading 32 are the truncated hash. */
+static std::string unspaced(std::string s)
+{
+    s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); }), s.end());
+    if (s.size() == 64 && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c); }))
+        s.resize(32);
+    return s;
+}
+
 static bool isHubHash(const std::string& s)
 {
     uint8_t b[16];
@@ -1421,7 +1431,7 @@ static void onCmdAdd(const char* key, const char* val)
 {
     TAKE(val);
     auto p = split(v, 2);
-    std::string hub = lower(trim(p[0]));
+    std::string hub = lower(unspaced(p[0]));
     if (!isHubHash(hub)) { warn("rrc: not a hub hash: %s", hub.c_str()); return; }
     saveHub(hub, p.size() > 1 ? trim(p[1]) : "");
     if (!storageExists(hubRam(hub, "state").c_str())) hubStatus(hub, "idle", "Not connected");
@@ -1433,7 +1443,7 @@ static void onCmdConnect(const char* key, const char* val)
 {
     TAKE(val);
     auto p = split(v, 2);
-    std::string hub = lower(trim(p[0]));
+    std::string hub = lower(unspaced(p[0]));
     if (!isHubHash(hub)) { warn("rrc: not a hub hash: %s", hub.c_str()); return; }
     saveHub(hub, "");
     if (p.size() > 1 && !p[1].empty()) {
@@ -1452,7 +1462,7 @@ static void onCmdConnect(const char* key, const char* val)
 static void onCmdDisconnect(const char* key, const char* val)
 {
     TAKE(val);
-    std::string hub = lower(trim(v));
+    std::string hub = lower(unspaced(v));
     if (!isHubHash(hub)) return;
     storageSet(hubKey(hub, "auto").c_str(), 0);
     s_retry.erase(hub);
@@ -1474,7 +1484,7 @@ static void roomForget(const std::string& rid)
 static void onCmdForget(const char* key, const char* val)
 {
     TAKE(val);
-    std::string hub = lower(trim(v));
+    std::string hub = lower(unspaced(v));
     if (!isHubHash(hub)) return;
     if (Slot* s = slotFor(hub)) slotFree(*s, false);
     s_retry.erase(hub);
@@ -1521,7 +1531,7 @@ static void onCmdJoin(const char* key, const char* val)
     TAKE(val);
     auto p = split(v, 3);
     if (p.size() < 2) return;
-    std::string hub = lower(trim(p[0]));
+    std::string hub = lower(unspaced(p[0]));
     if (!isHubHash(hub)) return;
     joinRoom(hub, p[1], p.size() > 2 ? p[2] : "");
 }
@@ -1545,6 +1555,25 @@ static void onCmdPart(const char* key, const char* val)
 {
     TAKE(val);
     partRoom(trim(v));
+}
+
+static void setNick(const std::string& hub, const std::string& nick)
+{
+    storageSet(hubKey(hub, "nick").c_str(), noBar(nick).c_str());
+    Slot* s = slotFor(hub);
+    if (!s) return;
+    std::string was = s->nick;
+    s->nick = nickFor(hub, s->sel);
+    storageSet(hubRam(hub, "nick").c_str(), s->nick.c_str());
+    if (s->nick == was) return;
+    for (auto& [rid, r] : s_rooms) {
+        if (r.hub != hub || r.state != "in") continue;
+        rosterSet(rid, hexOf(s->src, 6), s->nick, hexOf(s->src, 16));
+        LogLine l;
+        l.kind = KIND_SYSTEM;
+        l.text = "You are now known as " + s->nick;
+        logAppend(rid, l);
+    }
 }
 
 /* rrc.cmd.send = "<rid>|<nonce>|<text>" */
@@ -1581,11 +1610,7 @@ static void onCmdSend(const char* key, const char* val)
             return;
         }
         if (cmd == "nick") {
-            storageSet(hubKey(r.hub, "nick").c_str(), noBar(arg).c_str());
-            if (Slot* s = slotFor(r.hub)) {
-                s->nick = nickFor(r.hub, s->sel);
-                storageSet(hubRam(r.hub, "nick").c_str(), s->nick.c_str());
-            }
+            setNick(r.hub, arg);
             return;
         }
         command = true;
@@ -1689,13 +1714,9 @@ static void onCmdNick(const char* key, const char* val)
 {
     TAKE(val);
     auto p = split(v, 2);
-    std::string hub = lower(trim(p[0]));
+    std::string hub = lower(unspaced(p[0]));
     if (!isHubHash(hub)) return;
-    storageSet(hubKey(hub, "nick").c_str(), p.size() > 1 ? noBar(trim(p[1])).c_str() : "");
-    if (Slot* s = slotFor(hub)) {
-        s->nick = nickFor(hub, s->sel);
-        storageSet(hubRam(hub, "nick").c_str(), s->nick.c_str());
-    }
+    setNick(hub, p.size() > 1 ? trim(p[1]) : "");
 }
 
 /* rrc.cmd.ignore = "<id12>|<0|1>" */
@@ -1703,7 +1724,7 @@ static void onCmdIgnore(const char* key, const char* val)
 {
     TAKE(val);
     auto p = split(v, 2);
-    std::string id = lower(trim(p[0]));
+    std::string id = lower(unspaced(p[0]));
     if (id.size() != 12) return;
     if (p.size() > 1 && p[1] == "1") storageSet(("s.rrc.ignore." + id).c_str(), 1);
     else storageUnset(("s.rrc.ignore." + id).c_str());
@@ -1882,34 +1903,55 @@ static void cliRrc(const char* args)
         s = s.find(' ') == std::string::npos ? "" : trim(s.substr(s.find(' ') + 1));
         return f;
     };
+    /* A hub hash may be typed in space-separated groups, and in full (64 hex). */
+    auto hubArg = [&](std::string& s) {
+        auto isHex = [](const std::string& t) {
+            return !t.empty() && std::all_of(t.begin(), t.end(), [](unsigned char c) { return std::isxdigit(c); });
+        };
+        auto take = [&](size_t want, std::string& r) {
+            std::string h;
+            while (h.size() < want && !r.empty()) {
+                std::string t = r.substr(0, r.find(' '));
+                if (h.size() + t.size() > want || !isHex(t)) break;
+                h += t;
+                first(r);
+            }
+            return h;
+        };
+        std::string r = s, h = take(64, r);
+        if (h.size() != 64) { r = s; h = take(32, r); }
+        if (h.size() != 32 && h.size() != 64) return first(s);
+        s = r;
+        return h.substr(0, 32);
+    };
     if (verb.empty()) {
         storageForEach("s.rrc.hubs.", cliHubLeaf);
         return;
     }
     if (verb == "heard") { storageForEach("rrc.heard.", cliHeardLeaf); return; }
     if (verb == "connect") {
-        std::string hub = first(rest);
+        std::string hub = hubArg(rest);
         storageSet("rrc.cmd.connect", (hub + (rest.empty() ? "" : "|" + rest)).c_str());
         return;
     }
     if (verb == "disconnect") { storageSet("rrc.cmd.disconnect", rest.c_str()); return; }
     if (verb == "forget")     { storageSet("rrc.cmd.forget", rest.c_str()); return; }
     if (verb == "join") {
-        std::string hub = first(rest), room = first(rest);
+        std::string hub = hubArg(rest), room = first(rest);
         if (room.empty()) { cliPrintf("usage: rrc join <hub> <room> [key]\n"); return; }
         storageSet("rrc.cmd.join", (hub + "|" + room + (rest.empty() ? "" : "|" + rest)).c_str());
         return;
     }
-    std::string room = first(rest);
-    std::string rid = ridByName(room);
     if (verb == "notes") {
-        std::string hub = room;
+        std::string hub = lower(hubArg(rest));
         for (int i = 0; i < RRC_NOTES; ++i) {
             std::string n = storageGetStr((hubRam(hub, "notes.") + std::to_string(i)).c_str(), "");
             if (!n.empty()) cliPrintf("%s\n", n.c_str());
         }
         return;
     }
+    std::string room = first(rest);
+    std::string rid = ridByName(room);
     if (rid.empty()) { cliPrintf("no room %s (see `rrc`)\n", room.c_str()); return; }
     if (verb == "part") { storageSet("rrc.cmd.part", rid.c_str()); return; }
     if (verb == "who") {

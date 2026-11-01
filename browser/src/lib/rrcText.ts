@@ -98,12 +98,15 @@ const HEX32 = /^[0-9a-f]{32}$/
 /** Where an RRC link points: a hub, and a room on it ('' = the hub itself). */
 export interface RrcTarget { hub: string; room: string }
 
-/** `rrc://<hub>[:<dest>]/<room>`, `rrc@<hub>` or a bare 32-hex hub hash.
+/** `rrc://<hub>[:<dest>]/<room>`, `rrc@<hub>` or a bare 32-hex hub hash;
+ *  the last two may carry spaces anywhere, and give the hash in full (64 hex),
+ *  whose leading 32 are the hub.
  *  The hub is the first 32-hex part; `:<dest>` names a destination of the
  *  same hub and is taken as the hub only when the first part isn't a hash. */
 export function parseRrcLink(raw: string): RrcTarget | null {
   const s = raw.trim()
-  let m = /^rrc@([0-9a-fA-F]{32})$/.exec(s)
+  const bare = s.replace(/\s+/g, '').toLowerCase().replace(/^((?:rrc@)?[0-9a-f]{32})[0-9a-f]{32}$/, '$1')
+  let m = /^rrc@([0-9a-f]{32})$/.exec(bare)
   if (m) return { hub: m[1]!.toLowerCase(), room: '' }
   m = /^rrc:\/\/([^/:\s]*)(?::([^/\s]*))?(?:\/(\S*))?$/.exec(s)
   if (m) {
@@ -114,7 +117,7 @@ export function parseRrcLink(raw: string): RrcTarget | null {
     try { room = decodeURIComponent(room) } catch { /* taken as written */ }
     return { hub, room: bareRoom(room.replace(/\/+$/, '')) }
   }
-  if (HEX32.test(s.toLowerCase())) return { hub: s.toLowerCase(), room: '' }
+  if (HEX32.test(bare)) return { hub: bare, room: '' }
   return null
 }
 

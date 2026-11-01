@@ -34,7 +34,9 @@ of kind `notice` and is read like any other notice.
 ## Using it
 
 **Hubs.** Hubs heard announcing `rrc.hub` are listed under *On the mesh*; a hub
-can also be added by its 32-hex hash. Connecting is always an explicit act, and
+can also be added by its 32-hex hash. Wherever a hub hash is typed — the add
+fields, `rrc.cmd.*`, the `rrc` command — spaces anywhere are ignored, and the
+full 64-hex hash is taken as its leading 32. Connecting is always an explicit act, and
 a connected hub is reconnected after a reboot or a lost Link (5 s, 15 s, 45 s,
 2 min, then every 5 min, ±20 %) until it is disconnected. At most
 `s.rrc.max_hubs` hubs are connected at once; each holds one Reticulum Link.
@@ -55,6 +57,11 @@ and `/clear` are handled on the device, and anything else starting with `/` goes
 to the hub, whose answer is shown dimmed and kept only in RAM. `//` sends a
 literal slash. A line longer than the hub's body limit (350 bytes on rrcd) is
 refused before it is sent; it is never split.
+
+**Nick.** The nick rides on every envelope; there is no message that announces
+a change, so the hub and the room learn a new one with our next line. `/nick`
+(and `rrc.cmd.nick`) applies it locally at once: our roster entry in every room
+we are in on that hub, and a "You are now known as …" line in each.
 
 **Delivery.** A line is *queued* until the node's pacing lets it go, *relayed*
 (✓) when the hub echoes it back, *failed* (✗) when no echo comes within

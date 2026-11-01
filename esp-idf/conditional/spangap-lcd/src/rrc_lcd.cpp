@@ -907,7 +907,9 @@ void onHubRow(lv_event_t* e)  { openHub(boundString(e)); }
 
 void onAddHub(lv_event_t*) {
     if (!s_addTa) return;
-    std::string h = lower(trim(lv_textarea_get_text(s_addTa)));
+    std::string h = lower(lv_textarea_get_text(s_addTa));
+    h.erase(std::remove(h.begin(), h.end(), ' '), h.end());
+    if (h.size() == 64 && isHex32(h.substr(0, 32)) && isHex32(h.substr(32))) h.resize(32);
     if (!isHex32(h)) {
         /* Not a hub hash yet: the field says so in amber until it is edited. */
         lv_obj_set_style_border_color(s_addTa, lv_color_hex(C_AMBER), 0);
@@ -935,8 +937,8 @@ lv_obj_t* buildRow(lv_obj_t* list, const RowSpec& s) {
         s_addTa = lv_textarea_create(row);
         lv_textarea_set_one_line(s_addTa, true);
         lv_textarea_set_placeholder_text(s_addTa, "+ Add by hash (32 hex)");
-        lv_textarea_set_accepted_chars(s_addTa, "0123456789abcdefABCDEF");
-        lv_textarea_set_max_length(s_addTa, 32);
+        lv_textarea_set_accepted_chars(s_addTa, "0123456789abcdefABCDEF ");
+        lv_textarea_set_max_length(s_addTa, 128);
         lv_obj_set_style_text_font(s_addTa, kFont, 0);
         lv_obj_set_style_bg_opa(s_addTa, LV_OPA_TRANSP, 0);
         lv_obj_set_style_text_color(s_addTa, lv_color_white(), 0);
