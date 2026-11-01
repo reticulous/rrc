@@ -98,9 +98,12 @@ const HEX32 = /^[0-9a-f]{32}$/
 /** Where an RRC link points: a hub, and a room on it ('' = the hub itself). */
 export interface RrcTarget { hub: string; room: string }
 
-/** `rrc://<hub>[:<dest>]/<room>`, `rrc@<hub>` or a bare 32-hex hub hash;
- *  the last two may carry spaces anywhere, and give the hash in full (64 hex),
- *  whose leading 32 are the hub.
+/** `rrc://#<room>@<hub>` (or `#<room>@<hub>` without the scheme). */
+const ROOM_AT_HUB = /^(?:rrc:\/\/#?|#)([A-Za-z0-9][\w.\-]*)@([0-9a-fA-F]{32})(?:[0-9a-fA-F]{32})?$/
+
+/** `rrc://#<room>@<hub>`, `#<room>@<hub>`, `rrc://<hub>[:<dest>]/<room>`,
+ *  `rrc@<hub>` or a bare 32-hex hub hash; the last two may carry spaces
+ *  anywhere, and a hub may be given in full (64 hex), whose leading 32 are it.
  *  The hub is the first 32-hex part; `:<dest>` names a destination of the
  *  same hub and is taken as the hub only when the first part isn't a hash. */
 export function parseRrcLink(raw: string): RrcTarget | null {
@@ -108,6 +111,8 @@ export function parseRrcLink(raw: string): RrcTarget | null {
   const bare = s.replace(/\s+/g, '').toLowerCase().replace(/^((?:rrc@)?[0-9a-f]{32})[0-9a-f]{32}$/, '$1')
   let m = /^rrc@([0-9a-f]{32})$/.exec(bare)
   if (m) return { hub: m[1]!.toLowerCase(), room: '' }
+  m = ROOM_AT_HUB.exec(s)
+  if (m) return { hub: m[2]!.toLowerCase(), room: bareRoom(m[1]!) }
   m = /^rrc:\/\/([^/:\s]*)(?::([^/\s]*))?(?:\/(\S*))?$/.exec(s)
   if (m) {
     const a = (m[1] ?? '').toLowerCase(), b = (m[2] ?? '').toLowerCase()
@@ -129,12 +134,12 @@ export type Segment =
   | { t: 'room'; text: string; room: string }
   | { t: 'web'; text: string; url: string }
 
-/** Split a line into plain runs and tappable links: rrc:// and rrc@ (open in
- *  RRC), lxmf@<hash> (LXMF), <hash>:/page/… (Nomad), http(s) URLs, and a bare
- *  #room token (that room on the line's hub). Trailing sentence punctuation is
- *  kept outside a link. */
+/** Split a line into plain runs and tappable links: #room@hub (with or without
+ *  rrc://), rrc:// and rrc@ (open in RRC), lxmf@<hash> (LXMF), <hash>:/page/…
+ *  (Nomad), http(s) URLs, and a bare #room token (that room on the line's
+ *  hub). Trailing sentence punctuation is kept outside a link. */
 export function segmentLine(text: string): Segment[] {
-  const re = /(rrc:\/\/\S+)|(rrc@[0-9a-fA-F]{32})|(lxmf@[0-9a-fA-F]{32})|(https?:\/\/\S+)|([0-9a-fA-F]{32}):(\/\S+)|(^|[\s(,])(#[A-Za-z0-9][\w.\-]*)/g
+  const re = /((?:rrc:\/\/#?|(?<=^|[\s(,])#)[A-Za-z0-9][\w.\-]*@[0-9a-fA-F]{32}(?:[0-9a-fA-F]{32})?(?![0-9a-fA-F]))|(rrc:\/\/\S+)|(rrc@[0-9a-fA-F]{32})|(lxmf@[0-9a-fA-F]{32})|(https?:\/\/\S+)|([0-9a-fA-F]{32}):(\/\S+)|(?<=^|[\s(,])(#[A-Za-z0-9][\w.\-]*)/g
   const trailing = /[.,;:!?)\]}'"]+$/
   const out: Segment[] = []
   let last = 0
@@ -147,25 +152,28 @@ export function segmentLine(text: string): Segment[] {
   }
   while ((m = re.exec(text))) {
     if (m[1]) {
-      const s = m[1].replace(trailing, '')
+      const target = parseRrcLink(m[1])
+      if (target) push(m.index, { t: 'rrc', text: m[1], target })
+    } else if (m[2]) {
+      const s = m[2].replace(trailing, '')
       const target = parseRrcLink(s)
       if (target) push(m.index, { t: 'rrc', text: s, target })
-    } else if (m[2]) {
-      push(m.index, { t: 'rrc', text: m[2], target: { hub: m[2].slice(4).toLowerCase(), room: '' } })
     } else if (m[3]) {
-      push(m.index, { t: 'lxmf', text: m[3], hash: m[3].slice(5).toLowerCase() })
+      push(m.index, { t: 'rrc', text: m[3], target: { hub: m[3].slice(4).toLowerCase(), room: '' } })
     } else if (m[4]) {
-      const url = m[4].replace(trailing, '')
-      if (url) push(m.index, { t: 'web', text: url, url })
+      push(m.index, { t: 'lxmf', text: m[4], hash: m[4].slice(5).toLowerCase() })
     } else if (m[5]) {
+      const url = m[5].replace(trailing, '')
+      if (url) push(m.index, { t: 'web', text: url, url })
+    } else if (m[6]) {
       /* Not inside a longer hex run (a 64-hex id). */
       if (m.index > 0 && /[0-9a-fA-F]/.test(text[m.index - 1]!)) continue
-      const path = m[6]!.replace(trailing, '')
-      if (path) push(m.index, { t: 'nomad', text: `${m[5]}:${path}`,
-                                hash: m[5].toLowerCase(), path })
+      const path = m[7]!.replace(trailing, '')
+      if (path) push(m.index, { t: 'nomad', text: `${m[6]}:${path}`,
+                                hash: m[6].toLowerCase(), path })
     } else if (m[8]) {
       const tok = m[8].replace(/[.\-]+$/, '')
-      if (tok.length > 1) push(m.index + m[7]!.length, { t: 'room', text: tok, room: bareRoom(tok) })
+      if (tok.length > 1) push(m.index, { t: 'room', text: tok, room: bareRoom(tok) })
     }
   }
   if (last < text.length) out.push({ t: 'text', text: text.slice(last) })

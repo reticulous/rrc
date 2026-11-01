@@ -2675,8 +2675,8 @@ void onStandbyChange(const char*, const char* val) {
 }
 
 /* Another app asked to open a hub or a room: "<hub>[/<room>]|<nonce>". Runs on
- * the lcd task (subscribed through lcdRun in appInit). A room already in the
- * directory opens; otherwise its hub opens with the room in the join field. */
+ * the lcd task (subscribed through lcdRun in appInit). The hub is connected if
+ * it isn't and opens; a named room is joined and opens once it exists. */
 void onLcdOpenUrl(const char*, const char* val) {
     if (!val || !*val) return;
     std::string v = val;
@@ -2690,9 +2690,10 @@ void onLcdOpenUrl(const char*, const char* val) {
     lcdShowProgram("RRC");
     if (!s_layer) return;
     loadRooms();
-    std::string rid = room.empty() ? "" : findRid(hub, room);
-    if (!rid.empty()) openRoom(rid, false);
-    else              openHub(hub, room);
+    std::string st = hubState(hub);
+    if (!hubActive(st) && st != "need_ident") storageSet("rrc.cmd.connect", hub.c_str());
+    openHub(hub);
+    if (!room.empty()) joinRoom(hub, room);
 }
 
 bool g_subscribed = false;

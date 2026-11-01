@@ -199,18 +199,27 @@ function selectHub(hash: string, room = '') {
 }
 function clearSel() { sel.kind = ''; sel.id = '' }
 
-/* A link or another app naming a hub, and perhaps a room on it: the room if
- * the node keeps it, else the hub with the room ready to join. */
+/* A link or another app naming a hub, and perhaps a room on it: the hub is
+ * connected if it isn't, and the room joined and opened (a join connects the
+ * hub itself); with no room, the hub opens. */
 function openTarget(t: RrcTarget) {
-  const rid = t.room ? rrc.findRoom(t.hub, t.room) : ''
-  if (rid) selectRoom(rid)
-  else selectHub(t.hub, t.room)
+  if (t.room) {
+    connectIfIdle(t.hub)
+    joinAndOpen(t.hub, t.room)
+    return
+  }
+  connectIfIdle(t.hub)
+  selectHub(t.hub)
+}
+function connectIfIdle(hub: string) {
+  const st = rrc.hubOf(hub)?.state ?? ''
+  if (st === '' || st === 'idle' || st === 'held') rrc.connect(hub)
 }
 watch(rrcOpenReq, (r) => { if (r) openTarget({ hub: r.hub, room: r.room }) }, { immediate: true })
 
 function joinAndOpen(hub: string, room: string, key = '') {
   const rid = rrc.findRoom(hub, room)
-  if (rid) { selectRoom(rid); return }
+  if (rid && rrc.roomOf(rid)?.joined && !key) { selectRoom(rid); return }
   rrc.join(hub, room, key)
   pending.value = { hub, room: bareRoom(room) }
 }

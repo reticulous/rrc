@@ -63,6 +63,14 @@ a change, so the hub and the room learn a new one with our next line. `/nick`
 (and `rrc.cmd.nick`) applies it locally at once: our roster entry in every room
 we are in on that hub, and a "You are now known as …" line in each.
 
+**Links.** A room is linked as `rrc://#<room>@<hub>`, or just `#<room>@<hub>`
+(at the start of the text or after a space, `(` or `,`); `rrc://<hub>/<room>`,
+`rrc@<hub>` and a bare `#room` (on the line's own hub) are understood too. In
+the web log, and from LXMF and Nomad on both surfaces (through `rrc.url_web` /
+`rrc.url_lcd`), opening one connects the hub if it isn't and joins the room
+and opens it; a hub-only link opens the hub. The LCD log does not make links
+tappable.
+
 **Delivery.** A line is *queued* until the node's pacing lets it go, *relayed*
 (✓) when the hub echoes it back, *failed* (✗) when no echo comes within
 max(15 s, 4 × the round trip) or the Link drops. A failed line can be retried;
@@ -116,7 +124,7 @@ RAM:
 | `rrc.rooms.<rid>.{state,topic,mode,error,members}` | `state` = `out` · `joining` · `in`; `error` = why a join or a send was refused, finished text, empty when fine. |
 | `rrc.rooms.<rid>.who.<id12>` | `<nick>\|<identity hex or empty>\|<lxmf.delivery hex or empty>` |
 | `rrc.unread`, `rrc.mentions` | Totals over the rooms not set to Off. |
-| `rrc.url_web`, `rrc.url_lcd` | Written by another app to open RRC: `<hub>[/<room>]\|<nonce>`. |
+| `rrc.url_web`, `rrc.url_lcd` | Written by another app to open RRC: `<hub>[/<room>]\|<nonce>`. The hub is connected if it isn't; a room is joined and opened. |
 
 Commands (self-clearing; write the key, the task unsets it and acts):
 
