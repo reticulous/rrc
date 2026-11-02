@@ -25,11 +25,18 @@ hub, `kc1awv/rrcd`: the numeric limits map in WELCOME, the slash commands, the
 `rrc.hub` announce, resource envelopes for a long MOTD or notice. It advertises
 capabilities 0 (resources) and 1 (ACTION).
 
-rrcd sends a packet it cannot fit in one Link MDU (about 430 bytes) as
-nothing at all. A JOINED carrying a busy room's member list is such a packet,
-so the node takes the "room <r>: …" notice rrcd sends only to a successful
-joiner as being in the room too. A long reply to `/who` arrives as a Resource
-of kind `notice` and is read like any other notice.
+Every envelope rides one Link packet (about 430 bytes of payload), and hubs
+differ in what they do with one that does not fit. rrcd and rrc-hub, with
+their `include_joined_member_list` option on, send the joiner a JOINED listing
+every member's identity, and in a room of more than about 22 people that
+packet is dropped unsent. So the node also takes the "room <r>: …" notice a
+hub sends only to a successful joiner as being in the room. A long notice
+comes as a Resource of kind `notice`, or as several NOTICEs: each line its
+own, a long line cut into fixed-size pieces anywhere, even inside a word.
+What follows the first line of a `/who` or `/list` reply within 3 s is joined
+to it (a new `/list` line on a newline, any other piece directly) and the
+whole is parsed again, so the member list and the room directory are
+complete and no piece shows as a notice of its own.
 
 ## Using it
 

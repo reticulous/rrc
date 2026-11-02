@@ -11,8 +11,8 @@
  *               "active" a HELLO, resent every 4 s up to 5 times → WELCOME →
  *               rejoin every room wanted on that hub → live. A room is in on
  *               our own JOINED or on the "room <r>: …" notice that follows
- *               it, since rrcd drops a JOINED whose member list outgrows the
- *               Link MDU. A lost Link is a
+ *               it, since a hub drops a JOINED whose member list outgrows
+ *               the Link MDU. A lost Link is a
  *               new session after a backoff of 5 s · 15 s · 45 s · 2 min ·
  *               5 min (±20 %).
  *   pacing      everything sent to a hub goes through a token bucket that
@@ -23,9 +23,13 @@
  *   delivery    a line is queued, then relayed when the hub's echo carries its
  *               id back, or failed when no echo comes within max(15 s, 4 × the
  *               round trip) or the Link drops first.
- *   quiet cmds  /who after each JOINED and /list after WELCOME are sent for
- *               the member pane and the room directory; the NOTICE answering
- *               them is parsed and not shown. rrcd's JOINED carries the
+ *   quiet cmds  /who on entering a room and 3 s after the last JOINED or
+ *               PARTED there, and /list after WELCOME, are sent for the
+ *               member pane and the room directory; the reply is parsed and
+ *               not shown. A reply too long for one packet may come as
+ *               several NOTICEs (each line its own, a long line cut into
+ *               fixed-size pieces anywhere); what follows its first line
+ *               within RRC_CONT_MS is joined to it. rrcd's JOINED carries the
  *               joiner's nick but not their identity, so /who is also what
  *               turns a nick into the 12-hex identity prefix the roster keys on.
  *   announces   rrc.hub announces, app_data {"proto":"rrc","v":1,"hub":name},
@@ -80,6 +84,7 @@ static const char* TAG = "rrc";
 #define RRC_HELLO_EVERY_MS 4000
 #define RRC_HELLO_TRIES    5
 #define RRC_QUIET_MS       10000
+#define RRC_CONT_MS        3000
 #define RRC_RESERVE        4.0
 #define RRC_TICK_MS        500
 
@@ -502,6 +507,11 @@ struct Slot {
     std::string pingId;
     int64_t     pingSentMs = 0, lastPingMs = 0;
     std::map<std::string, int64_t> whoDue;  /* rid → when to refresh the roster quietly */
+    /* a /who or /list reply that may still be arriving in pieces */
+    std::string contKind, contText;         /* "who" | "list" | "" */
+    int64_t     contUntil = 0;
+    int         contNote = -1;              /* its hub note; -1 = asked quietly */
+    std::string contNoteRid;
 };
 
 static Slot s_slots[RRC_MAX_SLOTS];
@@ -548,16 +558,18 @@ static void hubStatus(const std::string& hub, const char* state, const std::stri
 }
 
 /** One line in the hub's notice ring. `rid` ties it to the room it answers,
- *  "" for the hub as a whole. RAM only. */
-static void hubNote(const std::string& hub, const std::string& rid, const std::string& text)
+ *  "" for the hub as a whole. RAM only. `at` rewrites that slot rather than
+ *  taking the next; the slot written is returned. */
+static int hubNote(const std::string& hub, const std::string& rid, const std::string& text, int at = -1)
 {
     static std::map<std::string, int> next;
-    int n = next[hub]++ % RRC_NOTES;
+    int n = at >= 0 ? at : next[hub]++ % RRC_NOTES;
     char v[16];
     std::snprintf(v, sizeof v, "%u|", (unsigned)wallS());
     std::string val = std::string(v) + rid + "|" + clean(text);
     storageSet((hubRam(hub, "notes.") + std::to_string(n)).c_str(), val.c_str());
     storageSet(hubRam(hub, "notes_next").c_str(), next[hub]);
+    return n;
 }
 
 static std::string nickFor(const std::string& hub, const std::string& sel)
@@ -986,11 +998,35 @@ static void onNoticeText(Slot& s, const std::string* room, const std::string& sr
         logAppend(rid, l);
         return;
     }
+    /* A /who or /list reply too long for one packet comes as several
+     * NOTICEs: each line its own, a long line cut into fixed-size pieces
+     * anywhere. A piece after the first line within RRC_CONT_MS is more of
+     * it (a new /list line goes on a newline, any other piece straight on),
+     * and the reply so far is parsed again; one we typed grows in its note. */
+    bool head = text.rfind("members in ", 0) == 0 || text.rfind("Registered public rooms:", 0) == 0 ||
+                text.rfind("No public rooms registered", 0) == 0;
+    if (!head && !s.contKind.empty() && nowMs() < s.contUntil) {
+        if (s.contKind == "list" && text.rfind("  ", 0) == 0) s.contText += '\n';
+        s.contText += text;
+        s.contUntil = nowMs() + RRC_CONT_MS;
+        std::string whoRid;
+        if (s.contKind == "who") parseWho(s, s.contText, whoRid);
+        else parseList(s, s.contText);
+        if (s.contNote >= 0) hubNote(s.hub, s.contNoteRid, s.contText, s.contNote);
+        return;
+    }
+    s.contKind.clear();
     std::string whoRid;
-    if (parseWho(s, text, whoRid)) {
-        if (takeQuiet(s, "who:" + whoRid)) return;
-    } else if (parseList(s, text)) {
-        if (takeQuiet(s, "list")) return;
+    bool isWho = parseWho(s, text, whoRid);
+    if (isWho || parseList(s, text)) {
+        s.contKind = isWho ? "who" : "list";
+        s.contText = text;
+        s.contUntil = nowMs() + RRC_CONT_MS;
+        s.contNote = -1;
+        if (takeQuiet(s, isWho ? "who:" + whoRid : "list")) return;
+        s.contNoteRid = nowMs() < s.lastCmdUntil ? s.lastCmdRid : "";
+        s.contNote = hubNote(s.hub, s.contNoteRid, text);
+        return;
     }
     /* The first notice after WELCOME that answers nothing we asked is the
      * hub's greeting. */
