@@ -160,6 +160,8 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { matPeople } from '@quasar/extras/material-icons'
 import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import { useCompact } from 'spangap-browser/lib/viewport'
+import { focusedWindowId } from 'spangap-browser/lib/windows'
+import { tabVisible, useRecentInput } from 'spangap-browser/lib/presence'
 import { useWinZoom } from 'rns/lib/winZoom'
 import RoomRail from '../components/rrc/RoomRail.vue'
 import RoomLog from '../components/rrc/RoomLog.vue'
@@ -354,6 +356,16 @@ watch(watched, (cur, prev) => {
   if (cur) rrc.watchHub(cur, true)
 }, { immediate: true })
 onBeforeUnmount(() => { if (watched.value) rrc.watchHub(watched.value, false) })
+
+/* ── The node refreshes a stale member list only for a room whose members are
+ * in front of somebody: the open room, its member pane shown, this the front
+ * window of a visible tab, and input here within five minutes ── */
+const recentInput = useRecentInput(5 * 60 * 1000)
+const rosterWatched = computed(() =>
+  props.visible && room.value && membersShown.value && focusedWindowId.value === 'rrc' &&
+  tabVisible.value && recentInput.value ? room.value.rid : '')
+watch(rosterWatched, (rid) => rrc.watchRoom(rid), { immediate: true })
+onBeforeUnmount(() => rrc.watchRoom(''))
 
 /* ── Rail groups: every saved hub, and any hub we have a room on ── */
 const groups = computed(() => {

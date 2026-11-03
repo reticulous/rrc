@@ -88,6 +88,18 @@ member list holds the first 12 hex of each identity (what rrcd's `/who` gives),
 and the full identity once that person has said something, from which their
 LXMF address follows. Ignoring someone hides their lines from then on.
 
+The list is asked for with a quiet `/who` on entering a room and on
+`rrc.cmd.who`. After that, a join or leave that names the identity (a hub's
+`include_joined_member_list`), or a leave whose nick is one member's, updates
+it on the spot. Any other join or leave makes it stale, and the `/who` that
+refreshes it goes only when all of these hold: the room has had no join or
+leave for 10 s, its last `/who` was at least a minute ago, and somebody is
+looking at its member list. That last is a lease a frontend holds through
+`rrc.cmd.watch` while the room is open with its member list showing, the
+window is in front (the web window the front one in a visible tab, the LCD
+app shown with the screen out of standby) and there has been input there in
+the last five minutes. A stale list waits, unasked for, until then.
+
 ## Storage
 
 Persistent (`s.`):
@@ -97,8 +109,8 @@ Persistent (`s.`):
 | `s.rrc.nick` | Default nick; empty = the LXMF display name of the identity in use. |
 | `s.rrc.sound` | `off` · `mentions` · `all` — the chirp (`/fixed/rrc/chirp.wav`). |
 | `s.rrc.keep` | Lines kept per room (default 500). |
-| `s.rrc.max_hubs` | Hubs connected at once (1–4, default 2). |
-| `s.rrc.presence` | Join/leave lines: `collapsed` (the frontends fold runs) · `shown` · `hidden` (not logged). |
+| `s.rrc.max_hubs` | Hubs connected at once (1–8, default 4). |
+| `s.rrc.presence` | Join/leave lines, shown while a room is open (never logged): `collapsed` (the frontends fold runs) · `shown` · `hidden` (not kept at all). |
 | `s.rrc.hubs.<hub>.{name,ident,nick,auto}` | A saved hub. `ident` = `lxmf<n>` \| `node`; `auto` = 1 while it should be connected. |
 | `s.rrc.ignore.<id12>` | 1 = lines from this identity are not logged. |
 | `secrets.rrc.keys.<rid>` | A room's `+k` key. |
@@ -108,13 +120,22 @@ Record stores (fetch them with `{"fetch": …}`; see spangap-core storage-intern
 | Store | Records | Fields |
 |---|---|---|
 | `s.rrc.rooms` (browser-mirrored) | one per room, keyed `<rid>` | `hub` (32 hex), `name`, `seq` (newest line), `read_seq`, `unread`, `mentions`, `last_ts` (unix s), `joined` (1 = wanted), `notify` (0 all · 1 mentions · 2 off), `preview` (finished one-line text of the newest line) |
-| `s.rrc.log.<rid>` (fetched while open) | one per line, keyed by the 8-digit `seq` | `ts` (unix s), `kind` (0 message · 1 action · 2 notice · 3 join/leave · 4 system), `state` (0 queued · 1 relayed · 2 failed · 3 received), `mention`, `own`, `src` (12 hex), `id` (16 hex), `nick`, `text` |
+| `s.rrc.log.<rid>` (fetched while open) | one per line, keyed by the 8-digit `seq` | `ts` (unix s), `kind` (0 message · 1 action · 2 notice · 4 system; 3 join/leave is the frontends' own, from the RAM ring), `state` (0 queued · 1 relayed · 2 failed · 3 received), `mention`, `own`, `src` (12 hex), `id` (16 hex), `nick`, `text` |
 
 A room's `name` is its wire name: trimmed, no leading `#`, lowercased — the form
 NomadNet, thatSFguy's Go hub and the Reticulum Mobile App send, so a room typed
 as `#Mesh` here is the room they call `mesh`. Frontends show it as `#mesh`.
-`<rid>` is the first four bytes, in hex, of sha256(hub hash ‖ that name). A
-join/leave line's `text` is `joined` or `left` and its `nick` who.
+`<rid>` is the first four bytes, in hex, of sha256(hub hash ‖ that name).
+
+A join or leave is never logged and never reaches flash. It takes the room's
+next `seq` as a line would, leaving a hole in the log, and goes to a RAM ring
+of the room's latest 32 (`rrc.rooms.<rid>.pres.*`). A frontend shows those
+that arrive while it has the room open, in their holes, as lines of kind 3
+whose `text` is `joined` or `left` and whose `nick` is who, and forgets them
+when the room closes. So `seq` in `s.rrc.rooms` is the newest *logged* line,
+and the window `s.rrc.keep` holds that many seqs back from it, holes included:
+each new line prunes every line at or below `seq − keep`, so lowering the
+setting trims the backlog with the room's next line.
 
 RAM:
 
@@ -130,6 +151,7 @@ RAM:
 | `rrc.heard.<hub>` | `<monotonic s>\|<hops>\|<name>` from the hub's announce. Age = now − (`sys.boot_time` + monotonic). |
 | `rrc.rooms.<rid>.{state,topic,mode,error,members}` | `state` = `out` · `joining` · `in`; `error` = why a join or a send was refused, finished text, empty when fine. |
 | `rrc.rooms.<rid>.who.<id12>` | `<nick>\|<identity hex or empty>\|<lxmf.delivery hex or empty>` |
+| `rrc.rooms.<rid>.pres.<n>`, `.pres_next` | The room's latest 32 joins and leaves, `<ts>\|<seq>\|<j\|l>\|<id12>\|<nick>` in slot `n mod 32`; `pres_next` counts every one written. |
 | `rrc.unread`, `rrc.mentions` | Totals over the rooms not set to Off. |
 | `rrc.url_web`, `rrc.url_lcd` | Written by another app to open RRC: `<hub>[/<room>]\|<nonce>`. The hub is connected if it isn't; a room is joined and opened. |
 
@@ -150,6 +172,7 @@ Commands (self-clearing; write the key, the task unsets it and acts):
 | `rrc.cmd.nick` | `<hub>\|<nick>` — empty = the default. |
 | `rrc.cmd.ignore` | `<id12>\|<0\|1>` |
 | `rrc.cmd.who` | `<rid>` — refresh the member list. |
+| `rrc.cmd.watch` | `web\|<rid>` or `lcd\|<rid>` — that frontend has the room's member list in front of somebody; held 45 s, so renewed every 15 s while it lasts. An empty `<rid>` ends it. |
 
 ## CLI
 

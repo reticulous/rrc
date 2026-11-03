@@ -40,7 +40,8 @@
  *     scrolls the log. The room's error (or its hub's status) shows under it.
  *   - Room info: topic, hub with hash and round trip, who we are, Notify
  *     (All · Mentions · Off), the member list, and Leave (asks first, naming
- *     the room).
+ *     the room). While it is in front of somebody the node may refresh the
+ *     member list (rrc.cmd.watch).
  *   - Member card: avatar, nick, identity, LXMF address, the other rooms they
  *     are in, when LXMF last heard them; Message on LXMF (hands the address to
  *     the LXMF app through lxmf.url_lcd), Mention (puts "@nick " in the room's
@@ -51,7 +52,7 @@
  * to it), saved hubs s.rrc.hubs, RAM state rrc.hubs.*, rrc.heard.*,
  * rrc.rooms.*, s.rrc.presence, s.rrc.ignore.*, LXMF identities for the chooser
  * and lxmf.announces.<hash> for the card. Written: rrc.cmd.{add,connect,
- * disconnect,forget,join,part,send,retry,read,notify,ignore},
+ * disconnect,forget,join,part,send,retry,read,notify,ignore,watch},
  * rrc.hubs.<hub>.watch and lxmf.url_lcd. The firmware publishes finished
  * strings (status, preview, error); they are shown as given, through
  * printable().
@@ -1190,6 +1191,8 @@ void setWatch(const std::string& hub, bool on) {
 
 std::string g_hub;                      /* hub on the hub screen */
 
+void roomWatchUpdate();
+
 void showScreen(Screen sc) {
     if (g_screen == SC_HUB && sc != SC_HUB) setWatch(g_hub, false);
     g_screen = sc;
@@ -1200,6 +1203,7 @@ void showScreen(Screen sc) {
         if (o == want) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
         else           lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
     }
+    roomWatchUpdate();
 }
 
 void dropPage(lv_obj_t*& o) {
@@ -1545,6 +1549,30 @@ void openHub(const std::string& hub, const std::string& room) {
 /* ---- room screen ---- */
 
 std::string g_rid;                      /* the open room */
+
+/* The room whose member list (its info page) is in front of somebody: the app
+ * shown, the screen out of standby, input within WATCH_IDLE_MS. The node
+ * refreshes a stale roster only for such a room, so it is told, as a lease it
+ * drops after 45 s: rrc.cmd.watch "lcd|<rid>", renewed every WATCH_RENEW_MS
+ * by g_watchTimer, and "lcd|" when that ends. */
+const uint32_t WATCH_IDLE_MS  = 5 * 60 * 1000;
+const int64_t  WATCH_RENEW_MS = 15000;
+std::string g_watchRid;
+int64_t     g_watchSentMs = 0;
+lv_timer_t* g_watchTimer = nullptr;
+
+void roomWatchUpdate() {
+    std::string rid = s_layer && g_shown && g_screen == SC_INFO && !storageGetInt("sys.standby", 0) &&
+                      lcdIdleMs() < WATCH_IDLE_MS ? g_rid : "";
+    int64_t now = esp_timer_get_time() / 1000;
+    if (rid == g_watchRid && (rid.empty() || now - g_watchSentMs < WATCH_RENEW_MS)) return;
+    g_watchRid = rid;
+    g_watchSentMs = now;
+    storageSet("rrc.cmd.watch", ("lcd|" + rid).c_str());
+}
+
+void watchTimerCb(lv_timer_t*) { roomWatchUpdate(); }
+
 std::string g_logScope;                 /* its log subscription, "s.rrc.log.<rid>" */
 Header    g_roomHdr;
 lv_obj_t* s_log = nullptr;              /* the log's scroll container */
@@ -1601,11 +1629,23 @@ void logLeaf(const char* key, const char* val) {
     else if (!strcmp(f, "text"))    l.text = v;
 }
 
+/* Joins and leaves are never logged: the node keeps the latest in a RAM ring
+ * per room (rrc.rooms.<rid>.pres.<n> = "<ts>|<seq>|<j|l>|<id12>|<nick>",
+ * pres_next counting every one written), each at a seq the log leaves empty.
+ * The open room collects those that arrive while it is open into g_pres,
+ * merged into g_lines, and drops them when it closes. */
+const int PRES_RING = 32;
+std::map<uint32_t, Line> g_pres;
+int g_presSeen = 0;
+
+int presNext() { return storageGetInt(("rrc.rooms." + g_rid + ".pres_next").c_str(), 0); }
+
 void loadLog() {
     g_lines.clear();
     if (g_rid.empty()) return;
     s_logPfx = "s.rrc.log." + g_rid + ".";
     storageForEach(s_logPfx.c_str(), logLeaf);
+    for (auto& [seq, l] : g_pres) g_lines.emplace(seq, l);
 }
 
 std::string lineBase(uint32_t seq) {
@@ -2024,6 +2064,48 @@ void patchLog() {
     maybeMarkRead();
 }
 
+/* Joins and leaves written to the ring since we last looked: into the open
+ * room, drawn at the bottom or, if one lands among drawn lines, by a redraw. */
+void presCollect() {
+    if (g_rid.empty()) return;
+    int next = presNext();
+    if (next < g_presSeen) g_presSeen = next;          /* the node restarted its count */
+    int from = std::max(g_presSeen, next - PRES_RING);
+    g_presSeen = next;
+    if (from >= next) return;
+    uint32_t lastDrawn = g_lrows.empty() ? (g_winFrom ? g_winFrom - 1 : 0) : g_lrows.back().last;
+    bool grew = false, structural = false;
+    for (int n = from; n < next; n++) {
+        std::string raw = storageGetStr(("rrc.rooms." + g_rid + ".pres." + std::to_string(n % PRES_RING)).c_str(), "");
+        size_t a = raw.find('|'), b = a == std::string::npos ? a : raw.find('|', a + 1);
+        size_t c = b == std::string::npos ? b : raw.find('|', b + 1);
+        size_t d = c == std::string::npos ? c : raw.find('|', c + 1);
+        if (d == std::string::npos) continue;
+        Line l;
+        l.ts = (uint32_t)strtoul(raw.c_str(), nullptr, 10);
+        l.seq = (uint32_t)strtoul(raw.c_str() + a + 1, nullptr, 10);
+        l.kind = KIND_PRESENCE;
+        l.text = raw.compare(b + 1, 1, "j") == 0 ? "joined" : "left";
+        l.src = raw.substr(c + 1, d - c - 1);
+        l.nick = raw.substr(d + 1);
+        if (!l.seq || g_lines.count(l.seq)) continue;
+        g_pres[l.seq] = l;
+        g_lines[l.seq] = l;
+        if (l.seq > lastDrawn || g_lrows.empty()) grew = true;
+        else if (l.seq >= g_winFrom) structural = true;
+    }
+    if (!s_logCol || g_loadTimer) return;
+    bool bottom = logAtBottom();
+    if (structural) {
+        captureAnchor();
+        renderAll();
+        if (bottom) scrollBottom(false); else restoreAnchor();
+    } else if (grew) {
+        appendNew();
+        if (bottom) scrollBottom(false); else updateChevron();
+    }
+}
+
 void onSend(lv_event_t*) {
     if (!s_compose || g_rid.empty()) return;
     std::string t = lcdInputBoxText(s_compose);
@@ -2202,6 +2284,7 @@ void leaveRoom() {
     g_logScope.clear();
     g_rid.clear();
     g_lines.clear();
+    g_pres.clear();
     g_lrows.clear();
     g_roster.clear();
     g_dirtySeqs.clear();
@@ -2222,6 +2305,8 @@ void openRoom(const std::string& rid, bool focus) {
         leaveRoom();
         g_rid = rid;
         g_readSent = 0;
+        g_pres.clear();
+        g_presSeen = presNext();
         readPresenceMode();
         g_roster = readRoster(rid);
         /* Where the room was read up to now: the "N new" divider stays there
@@ -2549,6 +2634,7 @@ void openCard(const std::string& id12, bool fromInfo) {
 /* What a burst of changes dirtied; the debounced timer does the work once. */
 bool g_dRooms = false, g_dSaved = false, g_dHeard = false, g_dHubs = false;
 bool g_dRoomRt = false, g_dRoster = false, g_dIgnore = false, g_dPresence = false;
+bool g_dPres = false;                   /* the open room's join/leave ring moved */
 lv_timer_t* g_metaTimer = nullptr;
 lv_timer_t* g_logTimer = nullptr;
 
@@ -2556,8 +2642,8 @@ void metaTimerCb(lv_timer_t*) {
     g_metaTimer = nullptr;
     if (!s_layer) return;
     bool rooms = g_dRooms, saved = g_dSaved, heard = g_dHeard, hubs = g_dHubs;
-    bool roomRt = g_dRoomRt, roster = g_dRoster, ignore = g_dIgnore, presence = g_dPresence;
-    g_dRooms = g_dSaved = g_dHeard = g_dHubs = g_dRoomRt = g_dRoster = g_dIgnore = g_dPresence = false;
+    bool roomRt = g_dRoomRt, roster = g_dRoster, ignore = g_dIgnore, presence = g_dPresence, pres = g_dPres;
+    g_dRooms = g_dSaved = g_dHeard = g_dHubs = g_dRoomRt = g_dRoster = g_dIgnore = g_dPresence = g_dPres = false;
     refreshFont();
     if (rooms) loadRooms();
     if (saved) loadSaved();
@@ -2604,6 +2690,7 @@ void metaTimerCb(lv_timer_t*) {
             renderAll();
             if (bottom) scrollBottom(false); else restoreAnchor();
         }
+        if (pres) presCollect();
         if (rooms || hubs || roomRt) { refreshRoomHeader(); refreshRoomNote(); }
         if (rooms) maybeMarkRead();
     }
@@ -2639,11 +2726,12 @@ void onStorageChange(const char* key, const char*) {
         if (strstr(key, ".notes") || strstr(key, ".watch")) return;
         g_dHubs = true;
     } else if (startsWith(key, "rrc.rooms.")) {
-        g_dRoomRt = true;
         if (!g_rid.empty()) {
-            std::string who = "rrc.rooms." + g_rid + ".who";
-            if (startsWith(key, who.c_str())) g_dRoster = true;
+            std::string room = "rrc.rooms." + g_rid + ".";
+            if (startsWith(key, (room + "pres").c_str())) { g_dPres = true; scheduleMeta(); return; }
+            if (startsWith(key, (room + "who").c_str())) g_dRoster = true;
         }
+        g_dRoomRt = true;
     } else return;
     scheduleMeta();
 }
@@ -2672,6 +2760,7 @@ void onLogChange(const char* key, const char*) {
 void onStandbyChange(const char*, const char* val) {
     if (!s_layer) return;
     if (val && atoi(val) == 0) maybeMarkRead();
+    roomWatchUpdate();
 }
 
 /* Another app asked to open a hub or a room: "<hub>[/<room>]|<nonce>". Runs on
@@ -2731,7 +2820,8 @@ void rrcApp(lv_obj_t* root) {
     g_cardHdr = Header{};
     g_cardId.clear(); s_cardIgnoreLbl = nullptr;
     g_metaTimer = nullptr; g_logTimer = nullptr;
-    g_dRooms = g_dSaved = g_dHeard = g_dHubs = g_dRoomRt = g_dRoster = g_dIgnore = g_dPresence = false;
+    g_dRooms = g_dSaved = g_dHeard = g_dHubs = g_dRoomRt = g_dRoster = g_dIgnore = g_dPresence = g_dPres = false;
+    g_pres.clear();
     g_focusTarget = nullptr;
     g_screen = SC_LIST;
     g_shown = true;
@@ -2750,6 +2840,8 @@ void rrcApp(lv_obj_t* root) {
         storageSubscribeChanges("sys.standby",    onStandbyChange);
         g_subscribed = true;
     }
+
+    if (!g_watchTimer) g_watchTimer = lv_timer_create(watchTimerCb, 5000, nullptr);
 
     loadRooms();
     loadSaved();
@@ -2787,6 +2879,7 @@ void RrcApp::onShow()
     if (!s_layer) return;
     if (g_screen == SC_HUB) setWatch(g_hub, true);
     if (g_screen == SC_ROOM) maybeMarkRead();
+    roomWatchUpdate();
 }
 
 void RrcApp::onHide()
@@ -2794,6 +2887,7 @@ void RrcApp::onHide()
     g_shown = false;
     if (!s_layer) return;
     if (g_screen == SC_HUB) setWatch(g_hub, false);
+    roomWatchUpdate();
     saveDraft();
 }
 
@@ -2806,6 +2900,8 @@ void RrcApp::onClose()
     g_logScope.clear();
     g_rid.clear();
     s_layer = nullptr;
+    roomWatchUpdate();
+    if (g_watchTimer) { lv_timer_delete(g_watchTimer); g_watchTimer = nullptr; }
     s_list = s_room = s_hub = s_info = s_card = nullptr;
     s_tabBtnR = s_tabBtnH = s_tabRooms = s_tabHubs = s_addTa = nullptr;
     g_rowsR.clear(); g_rowsH.clear();

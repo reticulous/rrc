@@ -51,5 +51,5 @@ settings:
             - { v: "hidden", l: "Not shown" }
       - integer: { label: "Lines kept per room", key: "s.rrc.keep", min: 50, max: 2000 }
       - caption: "Older lines are dropped from the device as new ones arrive."
-      - integer: { label: "Hubs connected at once", key: "s.rrc.max_hubs", min: 1, max: 4 }
+      - integer: { label: "Hubs connected at once", key: "s.rrc.max_hubs", min: 1, max: 8 }
       - caption: "Each connected hub holds one Reticulum Link open for as long as it is connected."

@@ -22,10 +22,11 @@
  *   rrc.heard.<hub>                                "<mono_s>|<hops>|<name>"
  *   rrc.rooms.<rid>.{state,topic,mode,error,members}
  *   rrc.rooms.<rid>.who.<id12>                     "<nick>|<identity hex>|<lxmf hex>"
+ *   rrc.rooms.<rid>.{pres.<n>,pres_next}           RAM ring of joins/leaves (never logged)
  *   rrc.unread / rrc.mentions                      totals over rooms not set to off
  *   rrc.url_web / rrc.url_lcd                      open a hub or room from another app
  * Commands (self-clearing): rrc.cmd.{add,connect,disconnect,forget,join,part,
- *   send,retry,read,notify,nick,ignore,who}. See README.md for each value.
+ *   send,retry,read,notify,nick,ignore,who,watch}. See README.md for each value.
  *
  * <rid> is the first four bytes, in hex, of sha256(hub hash ‖ lowercased room).
  */
@@ -34,7 +35,7 @@
 #include "service.h"
 
 /** Hubs the node holds a Link to at once, at most (s.rrc.max_hubs ≤ this). */
-#define RRC_MAX_SLOTS 4
+#define RRC_MAX_SLOTS 8
 
 /** Boot-registered service: starts the rrc task with the RNS lifecycle. */
 class RrcService : public Service {

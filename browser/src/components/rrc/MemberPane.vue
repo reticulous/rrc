@@ -42,7 +42,7 @@ function avStyle(m: RrcMember) {
            font-size: calc(13px * var(--rfs, 1)); color: #e8e8e8; user-select: none; }
 .lbl { display: flex; align-items: center; font-size: calc(11px * var(--rfs, 1)); color: #9a9a9a;
        letter-spacing: .8px; padding: 2px 14px 6px; }
-.ref { margin-left: auto; cursor: pointer; font-size: calc(13px * var(--rfs, 1)); letter-spacing: 0; }
+.ref { margin-left: auto; cursor: pointer; font-size: calc(19.5px * var(--rfs, 1)); letter-spacing: 0; line-height: 1; }
 .ref:hover { color: #e8e8e8; }
 .m { display: flex; align-items: center; gap: 8px; padding: 4px 14px; cursor: pointer; }
 .m:hover { background: #323232; }

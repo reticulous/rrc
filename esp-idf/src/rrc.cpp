@@ -23,10 +23,16 @@
  *   delivery    a line is queued, then relayed when the hub's echo carries its
  *               id back, or failed when no echo comes within max(15 s, 4 × the
  *               round trip) or the Link drops first.
- *   quiet cmds  /who on entering a room and 3 s after the last JOINED or
- *               PARTED there, and /list after WELCOME, are sent for the
- *               member pane and the room directory; the reply is parsed and
- *               not shown. A reply too long for one packet may come as
+ *   quiet cmds  /who and /list are sent for the member pane and the room
+ *               directory; the reply is parsed and not shown. /list goes
+ *               after WELCOME, /who on entering a room and on rrc.cmd.who.
+ *               A JOINED or PARTED that names the identity, or a PARTED
+ *               whose nick is one member's, settles the roster itself; any
+ *               other leaves it stale, and the /who that refreshes it waits
+ *               until the room has been quiet for RRC_WHO_SETTLE_MS, a
+ *               surface holds a rrc.cmd.watch lease on it (its member list
+ *               in front of somebody), and RRC_WHO_FLOOR_MS has passed
+ *               since the room's last /who. A reply too long for one packet may come as
  *               several NOTICEs (each line its own, a long line cut into
  *               fixed-size pieces anywhere); what follows its first line
  *               within RRC_CONT_MS is joined to it. rrcd's JOINED carries the
@@ -76,15 +82,19 @@ static const char* TAG = "rrc";
 #define RRC_ASPECT         "rrc.hub"
 #define RRC_CLIENT_NAME    "reticulous"
 #define RRC_CLIENT_VER     "0.1.0"
-#define RRC_TAG_PFX        "rrc"            /* link tags rrc0..rrc3 */
+#define RRC_TAG_PFX        "rrc"            /* link tags rrc0..rrc7 */
 #define RRC_LXMF_SLOTS     10
 #define RRC_HEARD_MAX      64
 #define RRC_NOTES          16               /* hub notice ring per hub */
+#define RRC_PRES_RING      32               /* join/leave ring per room */
 #define RRC_DEDUPE         64
 #define RRC_HELLO_EVERY_MS 4000
 #define RRC_HELLO_TRIES    5
 #define RRC_QUIET_MS       10000
 #define RRC_CONT_MS        3000
+#define RRC_WHO_SETTLE_MS  10000            /* quiet after a join/leave before /who */
+#define RRC_WHO_FLOOR_MS   60000            /* at most one presence /who a minute */
+#define RRC_WATCH_LEASE_MS 45000
 #define RRC_RESERVE        4.0
 #define RRC_TICK_MS        500
 
@@ -292,9 +302,11 @@ static std::string identLabel(const std::string& sel)
 struct Room {
     std::string hub, name;
     uint32_t    seq = 0, read_seq = 0, unread = 0, mentions = 0, last_ts = 0;
+    uint32_t    logSeq = 0;        /* newest logged line; seq runs ahead by joins/leaves */
     int         joined = 0, notify = NOTIFY_MENTIONS;
     /* RAM only */
     std::string state = "out";     /* out | joining | in */
+    uint32_t    floor = 0;         /* lowest seq the log may still hold; 0 = not yet known */
 };
 static std::map<std::string, Room> s_rooms;   /* rid → Room */
 
@@ -308,7 +320,7 @@ static void roomSave(const std::string& rid, const Room& r)
     storageBegin();
     storageSet(roomKey(rid, "hub").c_str(), r.hub.c_str());
     storageSet(roomKey(rid, "name").c_str(), r.name.c_str());
-    storageSet(roomKey(rid, "seq").c_str(), (int)r.seq);
+    storageSet(roomKey(rid, "seq").c_str(), (int)r.logSeq);
     storageSet(roomKey(rid, "read_seq").c_str(), (int)r.read_seq);
     storageSet(roomKey(rid, "unread").c_str(), (int)r.unread);
     storageSet(roomKey(rid, "mentions").c_str(), (int)r.mentions);
@@ -350,7 +362,7 @@ static void roomLoadLeaf(const char* key, const char* val)
     std::string v = val ? val : "";
     if (f == "hub") r.hub = v;
     else if (f == "name") r.name = v;
-    else if (f == "seq") r.seq = (uint32_t)std::atoll(v.c_str());
+    else if (f == "seq") r.seq = r.logSeq = (uint32_t)std::atoll(v.c_str());
     else if (f == "read_seq") r.read_seq = (uint32_t)std::atoll(v.c_str());
     else if (f == "unread") r.unread = (uint32_t)std::atoll(v.c_str());
     else if (f == "mentions") r.mentions = (uint32_t)std::atoll(v.c_str());
@@ -383,6 +395,25 @@ struct LogLine {
 
 static void playChirp();
 
+static uint32_t s_oldest = 0;
+static size_t   s_oldestPfx = 0;
+static void oldestLeaf(const char* key, const char*)
+{
+    if (!key || std::strlen(key) <= s_oldestPfx) return;
+    uint32_t seq = (uint32_t)std::strtoul(key + s_oldestPfx, nullptr, 10);
+    if (seq && (!s_oldest || seq < s_oldest)) s_oldest = seq;
+}
+
+/** The lowest seq in a room's log; 0 when it is empty. */
+static uint32_t logOldest(const std::string& rid)
+{
+    std::string pfx = "s.rrc.log." + rid + ".";
+    s_oldest = 0;
+    s_oldestPfx = pfx.size();
+    storageForEach(pfx.c_str(), oldestLeaf);
+    return s_oldest;
+}
+
 /** Append a line to a room's log, prune past s.rrc.keep, and keep the
  *  directory's counters and preview current. Returns the line's seq. */
 static uint32_t logAppend(const std::string& rid, const LogLine& l)
@@ -391,10 +422,12 @@ static uint32_t logAppend(const std::string& rid, const LogLine& l)
     if (it == s_rooms.end()) return 0;
     Room& r = it->second;
     uint32_t seq = ++r.seq;
+    r.logSeq = seq;
     std::string base = "s.rrc.log." + rid + "." + seqKey(seq) + ".";
     uint32_t ts = l.ts ? l.ts : wallS();
 
     bool counts = !l.own && (l.kind == KIND_MSG || l.kind == KIND_ACTION || l.kind == KIND_NOTICE);
+    if (!r.floor) r.floor = logOldest(rid);
     storageBegin();
     storageSet((base + "ts").c_str(), (int)ts);
     storageSet((base + "kind").c_str(), l.kind);
@@ -406,9 +439,18 @@ static uint32_t logAppend(const std::string& rid, const LogLine& l)
     storageSet((base + "nick").c_str(), l.nick.c_str());
     storageSet((base + "text").c_str(), l.text.c_str());
 
+    /* Every line at or below seq − keep goes: the one that just left the
+     * window, and all a lowered s.rrc.keep left behind it. Seqs have holes
+     * (a join or leave takes one and is never logged), so the lowest line
+     * still kept is tracked, found by a scan on the room's first line after
+     * boot. */
     int keep = storageGetInt("s.rrc.keep", 500);
-    if (keep > 0 && seq > (uint32_t)keep)
-        storageUnset(("s.rrc.log." + rid + "." + seqKey(seq - (uint32_t)keep)).c_str());
+    if (keep > 0 && seq > (uint32_t)keep) {
+        uint32_t top = seq - (uint32_t)keep;
+        for (uint32_t old = r.floor; old && old <= top; ++old)
+            storageUnset(("s.rrc.log." + rid + "." + seqKey(old)).c_str());
+        if (r.floor <= top) r.floor = top + 1;
+    }
 
     if (l.kind != KIND_PRESENCE && l.kind != KIND_SYSTEM) {
         r.last_ts = ts;
@@ -440,6 +482,29 @@ static uint32_t logAppend(const std::string& rid, const LogLine& l)
         }
     }
     return seq;
+}
+
+/** A join or leave. It takes the next seq, as a line would, but is never
+ *  logged and never reaches flash: it goes to a RAM ring per room,
+ *  rrc.rooms.<rid>.pres.<n> = "<ts>|<seq>|<j|l>|<id12>|<nick>", with pres_next
+ *  counting every one written. A frontend shows those that arrive while it
+ *  has the room open, in the log's hole at their seq. */
+static void presenceNote(const std::string& rid, bool joined, const std::string& nick,
+                         const std::string& id12)
+{
+    auto it = s_rooms.find(rid);
+    if (it == s_rooms.end()) return;
+    uint32_t seq = ++it->second.seq;
+    std::string base = "rrc.rooms." + rid + ".";
+    int next = storageGetInt((base + "pres_next").c_str(), 0);
+    char head[48];
+    std::snprintf(head, sizeof head, "%u|%u|%c|", (unsigned)wallS(), (unsigned)seq,
+                  joined ? 'j' : 'l');
+    storageBegin();
+    storageSet((base + "pres." + std::to_string(next % RRC_PRES_RING)).c_str(),
+               (head + id12 + "|" + clean(nick, true)).c_str());
+    storageSet((base + "pres_next").c_str(), next + 1);
+    storageEnd();
 }
 
 static void logSetState(const std::string& rid, uint32_t seq, int state)
@@ -506,7 +571,8 @@ struct Slot {
     int         rttMs = 0;
     std::string pingId;
     int64_t     pingSentMs = 0, lastPingMs = 0;
-    std::map<std::string, int64_t> whoDue;  /* rid → when to refresh the roster quietly */
+    std::map<std::string, int64_t> whoDue;  /* rid → roster stale; /who no sooner than */
+    std::map<std::string, int64_t> whoLast; /* rid → when /who last went */
     /* a /who or /list reply that may still be arriving in pieces */
     std::string contKind, contText;         /* "who" | "list" | "" */
     int64_t     contUntil = 0;
@@ -668,6 +734,25 @@ static void sendQuiet(Slot& s, const std::string& what, const std::string& cmd)
     slotSend(s, std::move(b), false);
 }
 
+/* The room whose member list each surface (web, LCD) has in front of somebody,
+ * as a lease the surface renews (rrc.cmd.watch). */
+struct Watch { std::string rid; int64_t until = 0; };
+static Watch s_watch[2];
+
+static bool roomWatched(const std::string& rid)
+{
+    for (auto& w : s_watch)
+        if (w.rid == rid && nowMs() < w.until) return true;
+    return false;
+}
+
+static void sendWho(Slot& s, const std::string& rid)
+{
+    s.whoDue.erase(rid);
+    s.whoLast[rid] = nowMs();
+    sendQuiet(s, "who:" + rid, "/who " + s_rooms[rid].name);
+}
+
 static void sendJoin(Slot& s, const std::string& rid)
 {
     Room& r = s_rooms[rid];
@@ -730,7 +815,7 @@ static int connectedCount()
 static bool slotOpen(const std::string& hub)
 {
     if (slotFor(hub)) return true;
-    int maxHubs = std::clamp(storageGetInt("s.rrc.max_hubs", 2), 1, RRC_MAX_SLOTS);
+    int maxHubs = std::clamp(storageGetInt("s.rrc.max_hubs", 4), 1, RRC_MAX_SLOTS);
     if (connectedCount() >= maxHubs) {
         hubStatus(hub, "idle", "Not connected: " + std::to_string(maxHubs) +
                   (maxHubs == 1 ? " hub is" : " hubs are") + " connected already");
@@ -777,7 +862,10 @@ static bool slotOpen(const std::string& hub)
     s->st = SL_LINKING;
     /* rnsd holds the identify and sends it at establishment, ahead of the
      * HELLO the "active" state below triggers. rrcd drops every packet of a
-     * Link that has not identified. */
+     * Link that has not identified. No hub proves the packets it receives,
+     * so rnsd is told not to wait for proofs. */
+    if (!rnsdLinkExpectProofs(tag.c_str(), false))
+        warn("rrc %s: proof expectation could not be queued", hub.c_str());
     if (!rnsdLinkIdentify(tag.c_str(), ik == "secrets.rnsd.identity" ? "" : ik.c_str()))
         warn("rrc %s: identify could not be queued", hub.c_str());
     s_retry.erase(hub);
@@ -938,7 +1026,7 @@ static void roomEntered(Slot& s, const std::string& rid)
     roomPublishState(rid, "in");
     rosterSet(rid, hexOf(s.src, 6), s.nick, hexOf(s.src, 16));
     info("rrc %s: in %s", s.hub.c_str(), r.name.c_str());
-    sendQuiet(s, "who:" + rid, "/who " + r.name);
+    sendWho(s, rid);
 }
 
 /* "room <r>: registered; mode=+nt; topic=<t>" after a JOIN, and
@@ -1144,25 +1232,41 @@ static void onPresence(Slot& s, const Value& env, bool joined)
     if (!joined && r.state == "parting") return;
 
     std::string who = nick ? clean(*nick, true) : "";
-    std::string id12;
+    std::string full;
     if (body && body->isArray() && !body->items.empty() && body->items[0].isBytes())
-        id12 = hexOf(body->items[0].s).substr(0, 12);
+        full = hexOf(body->items[0].s);
+    else if (body && body->isBytes())
+        full = hexOf(body->s);
+    std::string id12 = full.substr(0, 12);
     if (who.empty() && !id12.empty()) who = id12;
     if (who.empty()) who = "someone";
     if (id12 == hexOf(s.src, 6)) return;
 
-    if (storageGetStr("s.rrc.presence", "collapsed") != "hidden") {
-        LogLine l;
-        l.kind = KIND_PRESENCE;
-        l.nick = who;
-        l.src12 = id12;
-        l.text = joined ? "joined" : "left";
-        logAppend(rid, l);
+    if (storageGetStr("s.rrc.presence", "collapsed") != "hidden")
+        presenceNote(rid, joined, who, id12);
+    /* The roster knows people by identity. A JOINED or PARTED that carries it
+     * settles the roster at once, and a PARTED whose nick is one member's
+     * does too. Otherwise the roster is stale until a quiet /who, sent once
+     * the room has been quiet for RRC_WHO_SETTLE_MS and while somebody is
+     * looking at its member list. */
+    if (id12.size() == 12) {
+        if (joined) rosterSet(rid, id12, nick ? *nick : "", full.size() == 32 ? full : "");
+        else storageUnset(("rrc.rooms." + rid + ".who." + id12).c_str());
+        publishWho(rid);
+        return;
     }
-    /* The roster only knows people by identity; rrcd's JOINED and PARTED name
-     * them by nick. A quiet /who a moment later settles it. */
-    if (!joined && !id12.empty()) storageUnset(("rrc.rooms." + rid + ".who." + id12).c_str());
-    s.whoDue[rid] = nowMs() + 3000;
+    if (!joined && nick) {
+        std::string gone;
+        int n = 0;
+        for (auto& [k, v] : rosterOf(rid))
+            if (v.substr(0, v.find('|')) == noBar(*nick)) { gone = k; n++; }
+        if (n == 1) {
+            storageUnset(("rrc.rooms." + rid + ".who." + gone).c_str());
+            publishWho(rid);
+            return;
+        }
+    }
+    s.whoDue[rid] = nowMs() + RRC_WHO_SETTLE_MS;
 }
 
 static void requeueUnechoed(Slot& s)
@@ -1723,7 +1827,7 @@ static void onCmdRead(const char* key, const char* val)
     if (seq > r.seq) seq = r.seq;
     if (seq <= r.read_seq && r.unread == 0) return;
     r.read_seq = std::max(r.read_seq, seq);
-    if (r.read_seq >= r.seq) { r.unread = 0; r.mentions = 0; }
+    if (r.read_seq >= r.logSeq) { r.unread = 0; r.mentions = 0; }
     storageBegin();
     storageSet(roomKey(p[0], "read_seq").c_str(), (int)r.read_seq);
     storageSet(roomKey(p[0], "unread").c_str(), (int)r.unread);
@@ -1773,7 +1877,22 @@ static void onCmdWho(const char* key, const char* val)
     auto it = s_rooms.find(trim(v));
     if (it == s_rooms.end()) return;
     Slot* s = slotFor(it->second.hub);
-    if (s && s->st == SL_LIVE) sendQuiet(*s, "who:" + it->first, "/who " + it->second.name);
+    if (s && s->st == SL_LIVE) sendWho(*s, it->first);
+}
+
+/* rrc.cmd.watch = "web|<rid>" or "lcd|<rid>" — that surface has the room's
+ * member list in front of somebody, renewed within RRC_WATCH_LEASE_MS; an
+ * empty rid ends it. */
+static void onCmdWatch(const char* key, const char* val)
+{
+    TAKE(val);
+    size_t bar = v.find('|');
+    if (bar == std::string::npos) return;
+    std::string who = v.substr(0, bar);
+    if (who != "web" && who != "lcd") return;
+    Watch& w = s_watch[who == "lcd" ? 1 : 0];
+    w.rid = trim(v.substr(bar + 1));
+    w.until = w.rid.empty() ? 0 : nowMs() + RRC_WATCH_LEASE_MS;
 }
 
 /* ─────────────── housekeeping tick ─────────────── */
@@ -1802,11 +1921,14 @@ static void tick()
             if (now > it->until) it = s.quiet.erase(it); else ++it;
         }
         for (auto it = s.whoDue.begin(); it != s.whoDue.end();) {
-            if (now >= it->second) {
-                auto r = s_rooms.find(it->first);
-                if (r != s_rooms.end() && r->second.state == "in")
-                    sendQuiet(s, "who:" + it->first, "/who " + r->second.name);
+            auto r = s_rooms.find(it->first);
+            if (r == s_rooms.end() || r->second.state != "in") { it = s.whoDue.erase(it); continue; }
+            auto last = s.whoLast.find(it->first);
+            if (now >= it->second && roomWatched(it->first) &&
+                (last == s.whoLast.end() || now - last->second >= RRC_WHO_FLOOR_MS)) {
+                std::string rid = it->first;
                 it = s.whoDue.erase(it);
+                sendWho(s, rid);
             } else ++it;
         }
         /* Round trip, measured while somebody is looking at the hub. */
@@ -2086,6 +2208,7 @@ static void rrcTaskMain(void*)
     storageSubscribeChanges("rrc.cmd.nick",       onCmdNick);
     storageSubscribeChanges("rrc.cmd.ignore",     onCmdIgnore);
     storageSubscribeChanges("rrc.cmd.who",        onCmdWho);
+    storageSubscribeChanges("rrc.cmd.watch",      onCmdWatch);
     storageSubscribeChanges("rnsd.links." RRC_TAG_PFX, onLinkState);
 
     roomsLoad();
@@ -2140,7 +2263,7 @@ void RrcService::onInit()
     storageDefault("s.rrc.nick", "");
     storageDefault("s.rrc.sound", "mentions");
     storageDefault("s.rrc.keep", 500);
-    storageDefault("s.rrc.max_hubs", 2);
+    storageDefault("s.rrc.max_hubs", 4);
     storageDefault("s.rrc.presence", "collapsed");
     storageEnd();
 

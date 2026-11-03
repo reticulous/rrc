@@ -14,6 +14,7 @@
  *   s.rrc.log.<rid>            record store per room: fetched while the room is open
  *   rrc.rooms.<rid>.{state,topic,mode,error,members,who.<id12>}
  *   rrc.url_web                "<hub>[/<room>]|<nonce>" — another app opening RRC
+ *   rrc.cmd.watch              "web|<rid>" — the room whose members are in view (a lease)
  *
  * This is the only module that touches useDeviceStore; the components take
  * what it computes and call what it returns.
@@ -187,6 +188,8 @@ export interface UseRrc {
   ignore: (id12: string, on: boolean) => void
   who: (rid: string) => void
   watchHub: (hub: string, on: boolean) => void
+  /** The room whose member list is in front of somebody here, "" for none. */
+  watchRoom: (rid: string) => void
   openLxmf: (hash: string) => void
   openNomad: (hash: string, path: string) => void
 }
@@ -388,9 +391,40 @@ function build(): UseRrc {
     return new Set(Object.entries(tree).filter(([, v]) => num(v) === 1).map(([k]) => k.toLowerCase()))
   })
 
+  /* Joins and leaves are never logged: the node keeps the latest in a RAM ring
+   * per room (rrc.rooms.<rid>.pres.<n> = "<ts>|<seq>|<j|l>|<id12>|<nick>",
+   * pres_next counting every one written), each at a seq the log leaves
+   * empty. The open room collects those that arrive while it is open and
+   * drops them when it closes. */
+  const PRES_RING = 32
+  const presLines = ref<RrcLine[]>([])
+  let presSeen = 0
+  const presNext = () => num(device.get(`rrc.rooms.${openRid.value}.pres_next`))
+  watch(openRid, () => { presLines.value = []; presSeen = presNext() }, { immediate: true })
+  watch(presNext, (next) => {
+    if (!openRid.value) return
+    if (next < presSeen) presSeen = next   /* the node restarted its count */
+    const from = Math.max(presSeen, next - PRES_RING)
+    const add: RrcLine[] = []
+    for (let n = from; n < next; n++) {
+      const raw = str(device.get(`rrc.rooms.${openRid.value}.pres.${n % PRES_RING}`))
+      const f = raw.split('|')
+      if (f.length < 5) continue
+      add.push({
+        seq: num(f[1]), ts: num(f[0]), kind: LineKind.Presence, state: LineState.Received,
+        mention: false, own: false, src: f[3]!.toLowerCase(), id: '',
+        nick: f.slice(4).join('|'), text: f[2] === 'j' ? 'joined' : 'left',
+      })
+    }
+    presSeen = next
+    if (add.length) presLines.value = [...presLines.value, ...add]
+  })
+
   const log = (rid: string): RrcLine[] => {
     const tree = device.get(`s.rrc.log.${rid}`) ?? {}
     const out: RrcLine[] = []
+    if (rid === openRid.value)
+      for (const p of presLines.value) if (!(String(p.seq).padStart(8, '0') in tree)) out.push(p)
     for (const [k, r] of Object.entries<any>(tree)) {
       if (!r || typeof r !== 'object') continue
       out.push({
@@ -496,6 +530,20 @@ function build(): UseRrc {
     device.sendJson(nest(`rrc.hubs.${h}.watch`, on ? 1 : 0))
   }
 
+  /* The room whose member list is in front of somebody here, "" for none. The
+   * node refreshes a stale roster only for such a room and holds the claim as
+   * a 45 s lease, so it is renewed every 15 s while it lasts; a closed tab
+   * simply stops renewing. */
+  let watchedRid = ''
+  const sendWatch = () => cmd('watch', `web|${watchedRid}`)
+  const watchRoom = (rid: string) => {
+    if (rid === watchedRid) return
+    watchedRid = rid
+    sendWatch()
+  }
+  setInterval(() => { if (watchedRid) sendWatch() }, 15000)
+  watch(() => device.syncEpoch, () => { if (watchedRid) sendWatch() })
+
   /* Hand-offs to the other apps through their shared keys: nothing is called,
    * the other app reacts to the write. The nonce makes a repeat tap fresh. */
   const openLxmf = (hash: string) => {
@@ -514,7 +562,7 @@ function build(): UseRrc {
     draft: (rid) => drafts[rid] ?? '',
     setDraft: (rid, v) => { if (rid) drafts[rid] = v },
     add, connect, disconnect, forget, join, part, send, retry, markRead, setNotify,
-    setNick, ignore, who, watchHub, openLxmf, openNomad,
+    setNick, ignore, who, watchHub, watchRoom, openLxmf, openNomad,
   }
 }
 
