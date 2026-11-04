@@ -53,8 +53,14 @@
 #include "mem.h"
 #include "fs.h"
 #include "storage_db.h"
-#if CONFIG_STRADDLE_AUDIO
+/* The chirp needs the optional spangap/audio straddle AND a speaker: only a
+ * board with one turns CONFIG_AUDIO_OUT_ENABLE on, which is also what builds
+ * the audio engine that plays it. */
+#if CONFIG_STRADDLE_AUDIO && CONFIG_AUDIO_OUT_ENABLE
+#define RRC_SOUND 1
 #include "audio.h"
+#else
+#define RRC_SOUND 0
 #endif
 
 #include "freertos/FreeRTOS.h"
@@ -516,7 +522,7 @@ static void logSetState(const std::string& rid, uint32_t seq, int state)
 
 static void playChirp()
 {
-#if CONFIG_STRADDLE_AUDIO
+#if RRC_SOUND
     bool lcdAwake = storageExists("sys.standby") && storageGetInt("sys.standby", 0) == 0;
     audioPlayWav(FS_FIXED "/rrc/chirp.wav", lcdAwake ? 50 : 100);
 #endif
